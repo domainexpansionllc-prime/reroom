@@ -168,7 +168,7 @@ export default function NewMakeover() {
               {phase === "uploading" ? "Uploading your photo…" : "Restyling your room…"}
             </p>
             {phase === "generating" && (
-              <p className="text-muted">This takes 20–60 seconds · {elapsed}s</p>
+              <p className="text-muted">This takes 30–90 seconds · {elapsed}s</p>
             )}
           </div>
         </div>

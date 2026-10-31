@@ -111,7 +111,7 @@ export default function MakeoverPage() {
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 text-center">
             <Spinner className="h-10 w-10 text-moss" />
             <p className="font-serif text-2xl font-semibold text-ink">Restyling your room again…</p>
-            <p className="text-muted">This takes 20–60 seconds</p>
+            <p className="text-muted">This takes 30–90 seconds</p>
           </div>
         </div>
       </div>

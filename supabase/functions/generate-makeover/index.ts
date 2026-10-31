@@ -1,10 +1,21 @@
 // ReRoom · generate-makeover edge function
 // Browser calls: supabase.functions.invoke('generate-makeover', { body: { room_id, style, refresh_level } })
 //
-// Secrets needed (Supabase → Edge Functions → Secrets):
+// Pipeline (architecture guardrails):
+//   1. SURVEY   – vision model inventories the room's architecture (windows, doors, open archways, walls…)
+//                 and rejects photos that aren't living rooms, before any image is paid for.
+//   2. GENERATE – image model gets a prompt that names every architectural element that must not change,
+//                 plus a strict allow-list of what MAY change (furniture, paint, flooring, curtains, decor).
+//                 Palette + tips are generated in parallel.
+//   3. INSPECT  – vision model compares before/after on architecture only. If something was added, removed,
+//                 moved or covered, regenerate once with the specific problems called out.
+//
+// Secrets (Supabase → Edge Functions → Secrets):
 //   GEMINI_API_KEY        required — from aistudio.google.com
-//   GEMINI_IMAGE_MODEL    optional — default "gemini-2.5-flash-image" (Nano Banana)
-//   GEMINI_TEXT_MODEL     optional — default "gemini-2.5-flash" (palette + tips)
+//   GEMINI_IMAGE_MODEL    optional — default "gemini-3.1-flash-image" (Nano Banana 2).
+//                         "gemini-3-pro-image" (Nano Banana Pro) keeps structure even better but costs more and is slower.
+//   GEMINI_TEXT_MODEL     optional — default "gemini-3.8-flash" (survey, inspection, palette)
+//   STRUCTURE_CHECK       optional — "off" to skip step 3
 //   DAILY_LIMIT           optional — default 15
 // SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are provided automatically by Supabase.
 
@@ -29,34 +40,47 @@ const CORS = {
 };
 
 const GEMINI_BASE = Deno.env.get("GEMINI_BASE_URL") || "https://generativelanguage.googleapis.com/v1beta/models";
-const IMAGE_TIMEOUT_MS = 100_000;
-const TEXT_TIMEOUT_MS = 60_000;
+const IMAGE_MODEL = () => Deno.env.get("GEMINI_IMAGE_MODEL") || "gemini-3.1-flash-image";
+const TEXT_MODEL = () => Deno.env.get("GEMINI_TEXT_MODEL") || "gemini-3.8-flash";
+const IMAGE_TIMEOUT_MS = 90_000;
+const TEXT_TIMEOUT_MS = 40_000;
+const RETRY_IF_UNDER_MS = 70_000; // only retry when there's time left before the function's wall-clock limit
 
-const REFRESH_RULES: Record<string, string> = {
-  light:
-    "Only change wall colour, curtains, rugs, cushions, throws, lighting and small decor. Keep every existing piece of furniture in the same place and shape.",
-  full:
-    "You may replace furniture, flooring, lighting and decor to fit the style, but keep the room's architecture unchanged.",
+// What each refresh level may change. Architecture is never on this list.
+const ALLOWED: Record<string, string> = {
+  light: [
+    "- wall paint colour (paint only — no new wall panelling, wallpaper murals or built-ins)",
+    "- curtains, drapes or blinds, ONLY on windows that already exist",
+    "- rugs, cushions, throws and other soft textiles",
+    "- table and floor lamps, plants, wall art and small decorative objects",
+    "Keep every existing piece of furniture exactly where it is, with the same shape and size. You may only restyle its fabric or colour.",
+  ].join("\n"),
+  full: [
+    "- furniture: replace or restyle sofas, chairs, tables, shelving and storage, keeping a similar layout so walkways and openings stay clear",
+    "- wall paint colour (paint only)",
+    "- flooring material and colour (the floor stays the same size and shape)",
+    "- curtains, drapes or blinds, ONLY on windows that already exist",
+    "- rugs, textiles, light fixtures, lamps, plants, wall art and decor",
+  ].join("\n"),
 };
 
 function json(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...CORS, "Content-Type": "application/json" },
-  });
+  return new Response(JSON.stringify(body), { status, headers: { ...CORS, "Content-Type": "application/json" } });
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// ---------- Gemini calls ----------
+// ---------- Gemini plumbing ----------
 
 type Part = {
   text?: string;
   inlineData?: { mimeType?: string; data?: string };
   inline_data?: { mime_type?: string; data?: string };
 };
+type Img = { b64: string; mime: string };
+const imgPart = (i: Img) => ({ inline_data: { mime_type: i.mime, data: i.b64 } });
 
-async function callGemini(model: string, body: unknown, timeoutMs: number) {
+async function callGemini(model: string, body: unknown, timeoutMs: number): Promise<Part[]> {
   const key = Deno.env.get("GEMINI_API_KEY");
   if (!key) throw new Error("Server is missing GEMINI_API_KEY.");
   const res = await fetch(`${GEMINI_BASE}/${model}:generateContent`, {
@@ -79,39 +103,111 @@ async function callGemini(model: string, body: unknown, timeoutMs: number) {
   return parts;
 }
 
-async function generateImage(photoB64: string, photoMime: string, prompt: string) {
-  const model = Deno.env.get("GEMINI_IMAGE_MODEL") || "gemini-2.5-flash-image";
-  const parts = await callGemini(
-    model,
+async function askJson(parts: unknown[], timeoutMs = TEXT_TIMEOUT_MS): Promise<any> {
+  const out = await callGemini(
+    TEXT_MODEL(),
     {
-      contents: [{ role: "user", parts: [{ inline_data: { mime_type: photoMime, data: photoB64 } }, { text: prompt }] }],
+      contents: [{ role: "user", parts }],
+      generationConfig: { responseMimeType: "application/json" },
+    },
+    timeoutMs,
+  );
+  const raw = out.map((p) => p.text ?? "").join("").replace(/^```(json)?|```$/g, "").trim();
+  return JSON.parse(raw);
+}
+
+const str = (s: unknown, max = 200) => (typeof s === "string" ? s.trim().slice(0, max) : "");
+const strList = (a: unknown, n: number, max = 200) => (Array.isArray(a) ? a.map((x) => str(x, max)).filter(Boolean).slice(0, n) : []);
+
+// ---------- 1. SURVEY ----------
+
+type Survey = {
+  is_living_room: boolean;
+  windows: string[];
+  doors: string[];
+  openings: string[];
+  features: string[];
+  room: string;
+};
+
+async function surveyRoom(photo: Img): Promise<Survey> {
+  const prompt = `You are an architectural surveyor. Look carefully at this interior photo and list its FIXED ARCHITECTURE only (not furniture or decor). Be specific about count and position in the frame (left wall, back wall, right side, behind the sofa, etc.).
+
+Return JSON only:
+{
+  "is_living_room": true,
+  "windows": ["e.g. two tall rectangular windows on the left wall, side by side"],
+  "doors": ["e.g. white panel door on the right wall, closed"],
+  "openings": ["e.g. wide open rounded archway in the back wall leading to the dining room"],
+  "features": ["e.g. brick fireplace centred on the back wall", "exposed ceiling beams", "staircase on the right"],
+  "room": "one sentence on the room's shape, depth, ceiling height and the camera viewpoint"
+}
+
+Rules: "openings" means passages WITHOUT a door (archways, cased openings, pass-throughs, open plan connections) — list every one. Count windows exactly. Use [] when there are none. Set "is_living_room" to false if this is not an indoor living room, lounge or family room.`;
+  const o = await askJson([imgPart(photo), { text: prompt }]);
+  return {
+    is_living_room: o?.is_living_room !== false,
+    windows: strList(o?.windows, 8),
+    doors: strList(o?.doors, 6),
+    openings: strList(o?.openings, 6),
+    features: strList(o?.features, 8),
+    room: str(o?.room, 300),
+  };
+}
+
+// ---------- 2. GENERATE ----------
+
+function buildPrompt(styleName: string, styleDesc: string, refresh: string, s: Survey, fixes: string[] = []) {
+  const list = (label: string, items: string[]) => (items.length ? `${label}:\n${items.map((i) => `  • ${i}`).join("\n")}` : `${label}: none`);
+  return [
+    `Edit this photograph of a living room. Restyle the interior in ${styleName} style: ${styleDesc}`,
+    "",
+    "FIXED ARCHITECTURE — keep every item below EXACTLY as it is in the photo. Do not add, remove, move, resize, reshape, close, fill in or cover any of them:",
+    list("Windows", s.windows),
+    list("Doors", s.doors),
+    list("Open archways / openings (must stay fully open and see-through — never put curtains, doors, panels or walls in them)", s.openings),
+    list("Other fixed features", s.features),
+    `Room shape and viewpoint: ${s.room || "keep exactly as in the photo"}`,
+    "Also keep identical: the position of every wall, the room's size and depth, ceiling height, and the exact camera position, lens, framing and perspective. Do not add any new windows, doors, openings or walls.",
+    "",
+    `YOU MAY CHANGE ONLY:\n${ALLOWED[refresh]}`,
+    "",
+    ...(fixes.length
+      ? [`A previous attempt made these mistakes — make sure they do NOT happen:\n${fixes.map((f) => `  • ${f}`).join("\n")}`, ""]
+      : []),
+    "Output one photorealistic interior photograph from the identical viewpoint, natural daylight, high detail. No text, no people, no watermarks.",
+  ].join("\n");
+}
+
+async function generateImage(photo: Img, prompt: string): Promise<Img & { bytes: Uint8Array }> {
+  const parts = await callGemini(
+    IMAGE_MODEL(),
+    {
+      contents: [{ role: "user", parts: [imgPart(photo), { text: prompt }] }],
       generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
     },
     IMAGE_TIMEOUT_MS,
   );
   for (const p of parts) {
     const inline = p.inlineData ?? (p.inline_data && { mimeType: p.inline_data.mime_type, data: p.inline_data.data });
-    if (inline?.data) return { bytes: decodeBase64(inline.data), mime: inline.mimeType || "image/png" };
+    if (inline?.data) return { b64: inline.data, mime: inline.mimeType || "image/png", bytes: decodeBase64(inline.data) };
   }
   const text = parts.map((p) => p.text).filter(Boolean).join(" ").slice(0, 200);
   throw new Error(`AI did not return an image${text ? `: ${text}` : "."}`);
 }
 
 type Plan = {
-  is_living_room: boolean;
   palette: { role: string; name: string; hex: string }[];
   keep: string[];
   change_first: { item: string; why: string; cost: string }[];
 };
 
-async function generatePlan(photoB64: string, photoMime: string, styleName: string, refresh: string): Promise<Plan> {
-  const model = Deno.env.get("GEMINI_TEXT_MODEL") || "gemini-2.5-flash";
-  const budget = refresh === "light" ? "light refresh (paint and textiles, keep the furniture)" : "full makeover";
-  const prompt = `You are an interior designer. Look at this photo. The owner wants a ${styleName} look for their living room with a ${budget} budget.
+async function generatePlan(photo: Img, styleName: string, refresh: string): Promise<Plan> {
+  const budget = refresh === "light" ? "light refresh (paint and textiles, keep the furniture)" : "full makeover (furniture, paint and flooring)";
+  const prompt = `You are an interior designer. Look at this photo of a living room. The owner wants a ${styleName} look with a ${budget} budget. They cannot change the architecture (walls, windows, doors, archways).
 
 Return JSON only, in exactly this shape:
 {
-  "is_living_room": true,
   "palette": [
     {"role": "Dominant 60% · walls, large surfaces", "name": "", "hex": "#RRGGBB"},
     {"role": "Secondary 30% · furniture, curtains, rug", "name": "", "hex": "#RRGGBB"},
@@ -121,33 +217,39 @@ Return JSON only, in exactly this shape:
   "change_first": [{"item": "", "why": "", "cost": "$ | $$ | $$$"}]
 }
 
-Rules: set "is_living_room" to false if the photo is not an indoor living room or lounge. List at most 3 "keep" items and at most 4 "change_first" items, cheapest high-impact changes first (paint and textiles before furniture). If the room looks rented, avoid permanent changes. Keep each string under 120 characters.`;
-
-  const parts = await callGemini(
-    model,
-    {
-      contents: [{ role: "user", parts: [{ inline_data: { mime_type: photoMime, data: photoB64 } }, { text: prompt }] }],
-      generationConfig: { responseMimeType: "application/json", temperature: 0.4 },
-    },
-    TEXT_TIMEOUT_MS,
-  );
-  const raw = parts.map((p) => p.text ?? "").join("").replace(/^```(json)?|```$/g, "").trim();
-  const obj = JSON.parse(raw);
-
+Rules: at most 3 "keep" items and at most 4 "change_first" items, cheapest high-impact changes first (paint and textiles before furniture). Only suggest furniture, paint, flooring, window treatments, lighting and decor — never structural changes. If the room looks rented, avoid permanent changes. Keep each string under 120 characters.`;
+  const o = await askJson([imgPart(photo), { text: prompt }]);
   const hex = (h: unknown) => (typeof h === "string" && /^#?[0-9a-f]{6}$/i.test(h) ? (h.startsWith("#") ? h : `#${h}`) : null);
-  const str = (s: unknown) => (typeof s === "string" ? s.slice(0, 200) : "");
   return {
-    is_living_room: obj?.is_living_room !== false,
-    palette: (Array.isArray(obj?.palette) ? obj.palette : [])
+    palette: (Array.isArray(o?.palette) ? o.palette : [])
       .map((c: any) => ({ role: str(c?.role), name: str(c?.name), hex: hex(c?.hex) }))
       .filter((c: any) => c.hex)
       .slice(0, 3),
-    keep: (Array.isArray(obj?.keep) ? obj.keep : []).map(str).filter(Boolean).slice(0, 3),
-    change_first: (Array.isArray(obj?.change_first) ? obj.change_first : [])
-      .map((c: any) => ({ item: str(c?.item), why: str(c?.why), cost: str(c?.cost) }))
+    keep: strList(o?.keep, 3),
+    change_first: (Array.isArray(o?.change_first) ? o.change_first : [])
+      .map((c: any) => ({ item: str(c?.item), why: str(c?.why), cost: str(c?.cost, 10) }))
       .filter((c: any) => c.item)
       .slice(0, 4),
   };
+}
+
+// ---------- 3. INSPECT ----------
+
+async function inspect(before: Img, after: Img, s: Survey): Promise<{ ok: boolean; problems: string[] }> {
+  const prompt = `Image 1 is the ORIGINAL living room. Image 2 is an AI redesign of the same room.
+Judge ONLY the fixed architecture. Ignore furniture, paint colour, flooring, curtains on existing windows, rugs, lighting and decor — those are allowed to change.
+
+The original was surveyed as:
+- Windows: ${s.windows.join("; ") || "none"}
+- Doors: ${s.doors.join("; ") || "none"}
+- Open archways/openings: ${s.openings.join("; ") || "none"}
+- Other fixed features: ${s.features.join("; ") || "none"}
+
+Check: Are all windows still there (same count and position, not covered by new walls)? Are all doors there? Is every open archway/opening still open (not closed off, filled, or hidden behind curtains)? Are the walls in the same positions — is the room the same size and depth? Same ceiling? Same camera viewpoint? Were any new windows, doors or openings invented?
+
+Return JSON only: {"same_architecture": true, "problems": ["short, specific description of each problem"]}`;
+  const o = await askJson([{ text: "Image 1 (original):" }, imgPart(before), { text: "Image 2 (redesign):" }, imgPart(after), { text: prompt }]);
+  return { ok: o?.same_architecture !== false, problems: strList(o?.problems, 5) };
 }
 
 // ---------- handler ----------
@@ -155,19 +257,20 @@ Rules: set "is_living_room" to false if the photo is not an indoor living room o
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  const started = Date.now();
 
   const admin = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
-  // 1. Who is calling?
+  // Who is calling?
   const jwt = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "");
   if (!jwt) return json({ error: "Please sign in again." }, 401);
   const { data: userData, error: userErr } = await admin.auth.getUser(jwt);
   const user = userData?.user;
   if (userErr || !user) return json({ error: "Please sign in again." }, 401);
 
-  // 2. Validate input
+  // Validate input
   let body: { room_id?: string; style?: string; refresh_level?: string };
   try {
     body = await req.json();
@@ -185,23 +288,15 @@ Deno.serve(async (req) => {
   if (!room) return json({ error: "Room not found." }, 404);
   if (!style) return json({ error: "Unknown style." }, 400);
 
-  // 3. Daily limit (counts attempts; survives deletes)
+  // Daily limit (counts attempts; survives deletes)
   const limit = Number(Deno.env.get("DAILY_LIMIT") ?? 15);
   const { data: allowed, error: limitErr } = await admin.rpc("claim_generation", { p_user_id: user.id, p_daily_limit: limit });
   if (limitErr) return json({ error: "Could not check your daily limit." }, 500);
   if (!allowed) return json({ error: "Daily limit reached. You've used today's makeovers; come back tomorrow.", code: "limit" }, 429);
 
-  // 4. Create the makeover row
-  const prompt = [
-    `Redesign this living room photo in ${style.name} interior style: ${style.prompt_desc}`,
-    "Keep the exact same room: same walls, windows, doors, ceiling, floor plan, camera angle and perspective. Keep the same framing and aspect ratio as the original photo.",
-    REFRESH_RULES[refresh],
-    "Photorealistic interior photograph, natural daylight, high detail. No text, no people, no watermarks.",
-  ].join("\n\n");
-
   const { data: makeover, error: insErr } = await admin
     .from("makeovers")
-    .insert({ room_id: room.id, user_id: user.id, style: style.slug, refresh_level: refresh, status: "generating", prompt })
+    .insert({ room_id: room.id, user_id: user.id, style: style.slug, refresh_level: refresh, status: "generating" })
     .select()
     .single();
   if (insErr || !makeover) return json({ error: "Could not start the makeover." }, 500);
@@ -210,39 +305,74 @@ Deno.serve(async (req) => {
     const { data } = await admin.from("makeovers").update({ status: "failed", error: message }).eq("id", makeover.id).select().single();
     return json({ error: message, makeover: data }, status);
   };
+  const errMsg = (e: unknown) => {
+    const m = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    return /TimeoutError|timed out|aborted/i.test(m) ? "The AI took too long. Please try again." : (e instanceof Error ? e.message : m);
+  };
 
   try {
-    // 5. Get the original photo
+    // Original photo
     const { data: file, error: dlErr } = await admin.storage.from("rooms").download(room.original_path);
     if (dlErr || !file) return await fail("Could not read your photo. Try uploading it again.", 500);
-    const photoMime = file.type && file.type.startsWith("image/") ? file.type : "image/jpeg";
-    const photoB64 = encodeBase64(new Uint8Array(await file.arrayBuffer()));
+    const photo: Img = {
+      mime: file.type && file.type.startsWith("image/") ? file.type : "image/jpeg",
+      b64: encodeBase64(new Uint8Array(await file.arrayBuffer())),
+    };
 
-    // 6. Image + palette in parallel
-    const [imageRes, planRes] = await Promise.allSettled([
-      generateImage(photoB64, photoMime, prompt),
-      generatePlan(photoB64, photoMime, style.name, refresh),
-    ]);
-
-    if (planRes.status === "fulfilled" && !planRes.value.is_living_room) {
+    // 1. SURVEY (also rejects non-living-rooms before paying for an image)
+    let survey: Survey;
+    try {
+      survey = await surveyRoom(photo);
+    } catch (e) {
+      console.error("survey failed, continuing with generic guardrails:", e);
+      survey = { is_living_room: true, windows: [], doors: [], openings: [], features: [], room: "" };
+    }
+    if (!survey.is_living_room) {
       return await fail("This doesn't look like a living room. Please upload a photo of your living room.", 422);
     }
-    if (imageRes.status === "rejected") {
-      const msg = imageRes.reason instanceof Error ? imageRes.reason.message : String(imageRes.reason);
-      return await fail(msg.includes("TimeoutError") || msg.includes("timed out") ? "The AI took too long. Please try again." : msg);
-    }
-    if (planRes.status === "rejected") console.error("palette failed:", planRes.reason);
 
-    // 7. Store the result image
-    const ext = imageRes.value.mime.includes("jpeg") ? "jpg" : imageRes.value.mime.includes("webp") ? "webp" : "png";
+    // 2. GENERATE (+ palette in parallel)
+    let prompt = buildPrompt(style.name, style.prompt_desc, refresh, survey);
+    const planP = generatePlan(photo, style.name, refresh).catch((e) => {
+      console.error("palette failed:", e);
+      return null;
+    });
+    let image: Img & { bytes: Uint8Array };
+    try {
+      image = await generateImage(photo, prompt);
+    } catch (e) {
+      return await fail(errMsg(e));
+    }
+
+    // 3. INSPECT → regenerate once if the architecture changed
+    let inspection: { ok: boolean; problems: string[]; retried: boolean } = { ok: true, problems: [], retried: false };
+    if (Deno.env.get("STRUCTURE_CHECK") !== "off") {
+      try {
+        const r = await inspect(photo, image, survey);
+        inspection = { ...r, retried: false };
+        if (!r.ok && Date.now() - started < RETRY_IF_UNDER_MS) {
+          console.log("architecture changed, retrying:", r.problems);
+          const retryPrompt = buildPrompt(style.name, style.prompt_desc, refresh, survey, r.problems);
+          try {
+            image = await generateImage(photo, retryPrompt);
+            prompt = retryPrompt;
+            inspection.retried = true;
+          } catch (e) {
+            console.error("retry failed, keeping first image:", e);
+          }
+        }
+      } catch (e) {
+        console.error("inspection failed, keeping image:", e);
+      }
+    }
+
+    // Store result image
+    const ext = image.mime.includes("jpeg") ? "jpg" : image.mime.includes("webp") ? "webp" : "png";
     const imagePath = `${user.id}/makeovers/${makeover.id}.${ext}`;
-    const { error: upErr } = await admin.storage
-      .from("rooms")
-      .upload(imagePath, imageRes.value.bytes, { contentType: imageRes.value.mime, upsert: true });
+    const { error: upErr } = await admin.storage.from("rooms").upload(imagePath, image.bytes, { contentType: image.mime, upsert: true });
     if (upErr) return await fail("Could not save the makeover image.", 500);
 
-    // 8. Finish the row
-    const plan = planRes.status === "fulfilled" ? planRes.value : null;
+    const plan = await planP;
     const { data: done, error: updErr } = await admin
       .from("makeovers")
       .update({
@@ -250,6 +380,7 @@ Deno.serve(async (req) => {
         image_path: imagePath,
         palette: plan?.palette?.length ? plan.palette : null,
         tips: plan ? { keep: plan.keep, change_first: plan.change_first } : null,
+        prompt: `${prompt}\n\n[survey] ${JSON.stringify(survey)}\n[inspection] ${JSON.stringify(inspection)}\n[ms] ${Date.now() - started}`,
         error: null,
       })
       .eq("id", makeover.id)
@@ -260,6 +391,6 @@ Deno.serve(async (req) => {
     return json({ makeover: done });
   } catch (e) {
     console.error(e);
-    return await fail(e instanceof Error ? e.message : "Something went wrong. Please try again.", 500);
+    return await fail(errMsg(e), 500);
   }
 });

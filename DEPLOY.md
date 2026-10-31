@@ -5,7 +5,7 @@ The database (Supabase project `wueglazkbyvxaojsxpzw`) is already set up. Three 
 ## 1 · Google AI key (5 min)
 
 1. Go to **https://aistudio.google.com**, sign in with your Google account and click **Get API key → Create API key**. Copy it.
-2. Your Google AI **Pro** subscription covers the Gemini *app*, not the *API*. These are billed separately. Image generation through the API usually needs billing turned on: in AI Studio, click **Set up billing** next to your key. Nano Banana costs roughly **$0.04 per image**, so a full day of testing plus the demo is a few dollars.
+2. Your Google AI **Pro** subscription covers the Gemini *app*, not the *API*. These are billed separately. Image generation through the API usually needs billing turned on: in AI Studio, click **Set up billing** next to your key. Images cost a few cents each, so a full day of testing plus the demo is a few dollars.
    - If a makeover fails with "AI quota reached … limit: 0", that's the billing step.
 
 ## 2 · AI function in Supabase (5 min)
@@ -14,7 +14,7 @@ The database (Supabase project `wueglazkbyvxaojsxpzw`) is already set up. Three 
 2. **Edge Functions → Deploy a new function → Via Editor**. Name it exactly `generate-makeover`, delete the sample code, paste all of `supabase/functions/generate-makeover/index.ts`, and click **Deploy**.
 3. Open the function → **Settings** (or Details) → turn **OFF** "Verify JWT" / "Enforce JWT verification" → Save. The function checks the user's login itself, and leaving this on can block real users on new Supabase projects.
 
-Optional secrets: `GEMINI_IMAGE_MODEL` (default `gemini-2.5-flash-image`), `GEMINI_TEXT_MODEL` (default `gemini-2.5-flash`), `DAILY_LIMIT` (default 15).
+Optional secrets: `GEMINI_IMAGE_MODEL` (default `gemini-3.1-flash-image`), `GEMINI_TEXT_MODEL` (default `gemini-3.8-flash`), `DAILY_LIMIT` (default 15).
 
 ## 3 · Website on Vercel (10 min)
 

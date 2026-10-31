@@ -16,8 +16,8 @@ Upload photo       ───────────────▶ Storage: {us
                                     rooms row
 "Generate"         ─ room, style ─▶ Edge function generate-makeover
                                       checks login + daily limit
-                                      downloads the photo          ────▶ Nano Banana (image edit)
-                                                                   ────▶ Gemini Flash (palette + tips, JSON)
+                                      downloads the photo          ────▶ Nano Banana 2 (image edit)
+                                                                   ────▶ Gemini 3.8 Flash (survey, check, palette)
                                       saves image to Storage
                                       makeovers row → done
 Result page        ◀── signed URLs ─  before + after images
@@ -29,7 +29,7 @@ Result page        ◀── signed URLs ─  before + after images
 
 ## Stack
 
-React 18 + TypeScript + Vite + Tailwind · Supabase (Postgres, Auth, Storage, Edge Functions) · Gemini `gemini-2.5-flash-image` + `gemini-2.5-flash` · Vercel
+React 18 + TypeScript + Vite + Tailwind · Supabase (Postgres, Auth, Storage, Edge Functions) · Gemini Nano Banana 2 (`gemini-3.1-flash-image`) + Gemini 3.8 Flash (`gemini-3.8-flash`) · Vercel
 
 ## Project layout
 
