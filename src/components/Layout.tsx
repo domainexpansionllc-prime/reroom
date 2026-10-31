@@ -2,14 +2,26 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { supabase } from "../lib/supabase";
 import { useAuth } from "../lib/auth";
 
+// Mark: a house split down the middle like the compare slider —
+// left half outlined ("before"), right half filled ("after").
+export function LogoMark({ size = 30 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 32 32" aria-hidden="true">
+      <rect width="32" height="32" rx="9" fill="#2F5D46" />
+      <path d="M16 8.5L8.5 14.2V23.5H16" fill="none" stroke="#F8F6F1" strokeWidth="1.8" strokeLinejoin="round" />
+      <path d="M16 8.5L23.5 14.2V23.5H16Z" fill="#F8F6F1" />
+      <line x1="16" y1="6" x2="16" y2="26" stroke="#F8F6F1" strokeWidth="1.5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 export function Logo({ compact = false }: { compact?: boolean }) {
   return (
-    <span className="flex items-center gap-2 font-serif text-xl font-semibold text-ink">
-      <svg width="28" height="28" viewBox="0 0 32 32" aria-hidden="true">
-        <rect width="32" height="32" rx="8" fill="#2F5D46" />
-        <path d="M8 22V13l8-5 8 5v9h-6v-6h-4v6z" fill="#F8F6F1" />
-      </svg>
-      <span className={compact ? "hidden sm:inline" : ""}>ReRoom</span>
+    <span className="flex items-center gap-2.5 font-serif text-xl font-semibold tracking-tight text-ink">
+      <LogoMark />
+      <span className={compact ? "hidden sm:inline" : ""}>
+        <span className="text-moss">Re</span>Room
+      </span>
     </span>
   );
 }

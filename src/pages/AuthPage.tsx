@@ -46,7 +46,7 @@ export default function AuthPage() {
         <Logo />
       </header>
 
-      <main className="mx-auto grid max-w-6xl gap-10 px-4 pb-20 pt-6 lg:grid-cols-[1.15fr_1fr] lg:items-center lg:pt-12">
+      <main className="mx-auto grid max-w-6xl gap-10 px-4 pb-20 pt-6 lg:grid-cols-[1.15fr_1fr] lg:items-stretch lg:pt-12">
         <section>
           <p className="mb-4 inline-block rounded-full bg-moss-light px-3 py-1 text-xs font-semibold uppercase tracking-wider text-moss">
             AI living-room makeovers
@@ -60,10 +60,15 @@ export default function AuthPage() {
           </p>
 
           <ol className="mt-8 grid max-w-xl gap-3 sm:grid-cols-3">
-            {["Upload a photo", "Pick a style", "Compare & save"].map((s, i) => (
-              <li key={s} className="rounded-2xl border border-line bg-white p-4">
+            {[
+              ["Upload a photo", "Snap your living room from a corner or doorway."],
+              ["Pick a style", "Modern, Traditional, Boho or Mediterranean."],
+              ["Compare before & after", "Drag the slider, then keep your favourites in your gallery."],
+            ].map(([title, sub], i) => (
+              <li key={title} className="rounded-2xl border border-line bg-white p-4">
                 <span className="font-serif text-2xl font-semibold text-moss">{i + 1}</span>
-                <p className="mt-1 text-sm font-medium text-ink">{s}</p>
+                <p className="mt-1 text-sm font-medium text-ink">{title}</p>
+                <p className="mt-1 text-xs text-muted">{sub}</p>
               </li>
             ))}
           </ol>
@@ -80,7 +85,9 @@ export default function AuthPage() {
           )}
         </section>
 
-        <section className="rounded-3xl border border-line bg-white p-6 shadow-sm sm:p-8">
+        <section className="flex flex-col justify-center rounded-3xl border border-line bg-white p-6 shadow-sm sm:p-8 lg:p-10">
+          <h2 className="mb-1 font-serif text-2xl font-semibold text-ink">{mode === "signup" ? "Start your first makeover" : "Welcome back"}</h2>
+          <p className="mb-6 text-sm text-muted">{mode === "signup" ? "Free to try · 15 makeovers a day" : "Sign in to see your rooms and gallery."}</p>
           <div className="mb-6 flex rounded-full bg-sand p-1" role="tablist">
             {(["signup", "signin"] as const).map((m) => (
               <button
