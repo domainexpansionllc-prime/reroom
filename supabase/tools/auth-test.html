@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ReRoom Backend Tester</title>
+<!-- P3's test bench: proves auth, RLS and storage work BEFORE the Bolt front end exists.
+     Open this file in Chrome (double-click). Uses only the public anon key.
+     NEVER paste the service_role key here. -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<style>
+  :root { --bg:#f7f5f0; --card:#fff; --ink:#1f2a24; --muted:#5d6b63; --line:#dcd8cf; --accent:#2f5d46; --ok:#1e7a46; --bad:#b3261e; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+  main { max-width:880px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:15px; margin:0 0 10px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  p.sub { color:var(--muted); margin:0 0 20px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:8px; }
+  input { flex:1 1 220px; min-width:0; padding:9px 10px; border:1px solid var(--line); border-radius:8px; font:inherit; }
+  button { padding:9px 14px; border:0; border-radius:8px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  #who { font-family:ui-monospace, Consolas, monospace; font-size:13px; word-break:break-all; }
+  #log { font-family:ui-monospace, Consolas, monospace; font-size:12.5px; background:#14201a; color:#d9e6dd; border-radius:10px; padding:12px; height:260px; overflow:auto; white-space:pre-wrap; }
+  .ok { color:#7fe0a5; } .bad { color:#ff9b93; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:10px; }
+  .grid figure { margin:0; border:1px solid var(--line); border-radius:10px; overflow:hidden; background:#fafafa; }
+  .grid img { width:100%; aspect-ratio:4/3; object-fit:cover; display:block; }
+  .grid figcaption { font-size:12px; padding:6px 8px; color:var(--muted); display:flex; justify-content:space-between; gap:6px; }
+  .grid figcaption button { padding:2px 8px; font-size:12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ReRoom backend tester</h1>
+  <p class="sub">Test sign-up, sign-in, upload and privacy against your Supabase project, with no front end needed.</p>
+
+  <section>
+    <h2>1 · Project</h2>
+    <div class="row"><input id="url" placeholder="Project URL  (https://xxxx.supabase.co)"></div>
+    <div class="row"><input id="key" placeholder="anon public key  (Settings → API)"><button id="connect">Connect</button></div>
+  </section>
+
+  <section>
+    <h2>2 · Auth</h2>
+    <div class="row"><input id="email" type="email" placeholder="email"><input id="pw" type="password" placeholder="password (6+ chars)"></div>
+    <div class="row">
+      <button data-need="client" id="signup">Sign up</button>
+      <button data-need="client" id="signin">Sign in</button>
+      <button data-need="client" id="signout" class="ghost">Sign out</button>
+    </div>
+    <div id="who">Not connected.</div>
+  </section>
+
+  <section>
+    <h2>3 · Data &amp; storage (as the signed-in user)</h2>
+    <div class="row">
+      <input id="file" type="file" accept="image/jpeg,image/png,image/webp">
+      <button data-need="user" id="upload">Upload living-room photo</button>
+    </div>
+    <div class="row">
+      <button data-need="user" id="list" class="ghost">List my rooms</button>
+      <button data-need="client" id="styles" class="ghost">Load styles</button>
+      <button data-need="user" id="left" class="ghost">Generations left</button>
+    </div>
+    <div class="row">
+      <input id="other" placeholder="Another user's UID (sign in as user B, paste user A's UID)">
+      <button data-need="user" id="spy" class="ghost">Try to read their data</button>
+    </div>
+    <div class="grid" id="grid"></div>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let sb = null, user = null;
+
+function log(msg, cls) {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  $('log').prepend(line);
+}
+const ok  = (m) => log('✔ ' + m, 'ok');
+const bad = (m) => log('✖ ' + m, 'bad');
+
+function store(k, v) { try { localStorage.setItem('reroom-tester-' + k, v); } catch (e) {} }
+function load(k)     { try { return localStorage.getItem('reroom-tester-' + k) || ''; } catch (e) { return ''; } }
+
+function refreshButtons() {
+  document.querySelectorAll('[data-need]').forEach((b) => {
+    b.disabled = b.dataset.need === 'client' ? !sb : !user;
+  });
+  $('who').textContent = !sb ? 'Not connected.'
+    : user ? 'Signed in as ' + user.email + '  ·  UID ' + user.id
+    : 'Connected · signed out.';
+}
+
+$('url').value = load('url'); $('key').value = load('key');
+
+function normalizeUrl(raw) {
+  let u = raw.trim();
+  const dash = u.match(/supabase\.com\/dashboard\/project\/([a-z0-9]+)/i);   // pasted the dashboard link
+  if (dash) { log('That was the dashboard link. Using the Project URL instead.'); return `https://${dash[1]}.supabase.co`; }
+  if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+  try { const p = new URL(u); return p.origin; } catch (e) { return u; }       // strip /rest/v1, trailing slash, etc.
+}
+
+$('connect').onclick = async () => {
+  const url = normalizeUrl($('url').value), key = $('key').value.trim();
+  $('url').value = url;
+  if (!url || !key) return bad('Enter the project URL and anon key.');
+  if (!/^https:\/\/[a-z0-9]+\.supabase\.co$/i.test(url)) log('Heads-up: Project URLs normally look like https://xxxx.supabase.co');
+  try {
+    const r = await fetch(url + '/auth/v1/settings', { headers: { apikey: key } });
+    if (r.status === 401 || r.status === 403) return bad('Reached Supabase, but the key was rejected. Re-copy the publishable/anon key from Project Settings → API Keys.');
+    if (!r.ok) return bad('Reached ' + url + ' but got HTTP ' + r.status + '. Is the project still setting up?');
+    ok('Supabase is reachable and the key works.');
+  } catch (e) {
+    return bad('Could not reach ' + url + ' at all. Check: (1) it is the Project URL from Project Settings → Data API, (2) no ad blocker / privacy extension (try Incognito), (3) no VPN or work network blocking supabase.co.');
+  }
+  if (key.length > 20) {
+    try {
+      const payload = JSON.parse(atob(key.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+      if (payload.role === 'service_role') return bad('That is the SERVICE ROLE key. Use the anon/public key. Never put the service key in a browser.');
+    } catch (e) { /* new-format publishable keys aren't JWTs; fine */ }
+  }
+  store('url', url); store('key', key);
+  sb = supabase.createClient(url, key);
+  sb.auth.onAuthStateChange((_event, session) => { user = session?.user ?? null; refreshButtons(); });
+  const { data } = await sb.auth.getSession();
+  user = data.session?.user ?? null;
+  ok('Connected to ' + url);
+  refreshButtons();
+};
+
+$('signup').onclick = async () => {
+  const { data, error } = await sb.auth.signUp({ email: $('email').value.trim(), password: $('pw').value });
+  if (error) return bad('Sign up: ' + error.message);
+  data.session ? ok('Signed up and signed in (email confirmation is OFF, good for the demo).')
+               : log('Signed up, but no session: "Confirm email" is ON. Turn it off in Auth → Providers → Email for the hackathon.');
+};
+
+$('signin').onclick = async () => {
+  const { error } = await sb.auth.signInWithPassword({ email: $('email').value.trim(), password: $('pw').value });
+  error ? bad('Sign in: ' + error.message) : ok('Signed in.');
+};
+
+$('signout').onclick = async () => {
+  await sb.auth.signOut(); $('grid').innerHTML = ''; ok('Signed out.');
+};
+
+$('upload').onclick = async () => {
+  const f = $('file').files[0];
+  if (!f) return bad('Pick an image first.');
+  const roomId = crypto.randomUUID();
+  const path = `${user.id}/originals/${roomId}.jpg`;
+  const up = await sb.storage.from('rooms').upload(path, f, { contentType: f.type, upsert: true });
+  if (up.error) return bad('Upload: ' + up.error.message);
+  ok('Uploaded to ' + path);
+  const ins = await sb.from('rooms').insert({ id: roomId, original_path: path }).select().single();
+  if (ins.error) return bad('Insert rooms row: ' + ins.error.message);
+  ok('rooms row created: ' + JSON.stringify({ id: ins.data.id, title: ins.data.title, room_type: ins.data.room_type }));
+  $('list').click();
+};
+
+$('list').onclick = async () => {
+  const { data, error } = await sb.from('rooms').select('*').order('created_at', { ascending: false });
+  if (error) return bad('List rooms: ' + error.message);
+  ok(data.length + ' room(s) found');
+  $('grid').innerHTML = '';
+  for (const r of data) {
+    const s = await sb.storage.from('rooms').createSignedUrl(r.original_path, 3600);
+    const fig = document.createElement('figure');
+    const img = document.createElement('img');
+    img.alt = r.title; if (s.data) img.src = s.data.signedUrl;
+    const cap = document.createElement('figcaption');
+    const label = document.createElement('span'); label.textContent = r.title;
+    const del = document.createElement('button'); del.textContent = 'Delete'; del.className = 'ghost';
+    del.onclick = async () => {
+      // Front end must remove files itself: deleting rows does not delete storage objects.
+      const mk = await sb.from('makeovers').select('image_path').eq('room_id', r.id);
+      const paths = [r.original_path, ...(mk.data || []).map((m) => m.image_path).filter(Boolean)];
+      const rm = await sb.storage.from('rooms').remove(paths);
+      if (rm.error) return bad('Remove files: ' + rm.error.message);
+      const d = await sb.from('rooms').delete().eq('id', r.id);
+      d.error ? bad('Delete room: ' + d.error.message) : ok('Deleted room + ' + paths.length + ' file(s)');
+      $('list').click();
+    };
+    cap.append(label, del); fig.append(img, cap); $('grid').append(fig);
+  }
+};
+
+$('styles').onclick = async () => {
+  const { data, error } = await sb.from('styles').select('slug,name,tagline,swatches').order('sort_order');
+  error ? bad('Styles: ' + error.message) : ok('Styles: ' + data.map((s) => `${s.name} (${s.slug})`).join(', '));
+};
+
+$('left').onclick = async () => {
+  const { data, error } = await sb.rpc('my_generations_left');
+  error ? bad('my_generations_left: ' + error.message) : ok(data + ' generations left in the last 24h');
+};
+
+$('spy').onclick = async () => {
+  const other = $('other').value.trim();
+  if (!other) return bad('Paste another user\'s UID.');
+  const rows = await sb.from('rooms').select('id').eq('user_id', other);
+  rows.error ? ok('Rooms query blocked: ' + rows.error.message)
+    : rows.data.length === 0 ? ok('Rooms: 0 rows visible. RLS is protecting them.')
+    : bad('PRIVACY BUG: can see ' + rows.data.length + ' of their rooms!');
+  const files = await sb.storage.from('rooms').list(other + '/originals');
+  files.error ? ok('Storage list blocked: ' + files.error.message)
+    : (files.data || []).length === 0 ? ok('Storage: 0 files visible. Bucket policies are protecting them.')
+    : bad('PRIVACY BUG: can see ' + files.data.length + ' of their files!');
+  const up = await sb.storage.from('rooms').upload(other + '/originals/intruder.jpg', new Blob(['x'], { type: 'image/jpeg' }));
+  up.error ? ok('Upload into their folder blocked.') : bad('PRIVACY BUG: uploaded into their folder!');
+};
+
+refreshButtons();
+if ($('url').value && $('key').value) $('connect').click();
+</script>
+</body>
+</html>
